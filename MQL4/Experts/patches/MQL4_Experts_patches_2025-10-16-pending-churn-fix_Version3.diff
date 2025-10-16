@@ -1,0 +1,114 @@
+diff --git a/MQL4/Experts/HybridGridEA_AllInOne_V0.3.mq4 b/MQL4/Experts/HybridGridEA_AllInOne_V0.3.mq4
+--- a/MQL4/Experts/HybridGridEA_AllInOne_V0.3.mq4
++++ b/MQL4/Experts/HybridGridEA_AllInOne_V0.3.mq4
+@@ -106,6 +106,12 @@
+ input bool   RecenterWhenRangeShifts  = true;
+ input double RecenterThresholdPct     = 15.0;
+ input bool   AutoRebuildOnRegimeChange= true;   // delete incompatible pendings on mode flip
++
++// Rebuild guards (new)
++input bool   RecenterCheckOnNewBarOnly = true;  // NEW: only evaluate recenter at bar close
++input int    RebuildThrottleSeconds    = 60;    // NEW: minimum seconds between any rebuild/cancel ops
++input int    RegimeChangeConfirmBars   = 1;     // NEW: require effMode stability across N closed bars before rebuild
++
+@@ -278,6 +284,11 @@
+ int      g_lastEffMode     = -999;     // to detect regime changes
++
++// NEW: throttles and stability tracking
++datetime g_lastRebuildAt   = 0;
++int      g_modeStableBars  = 0;
++int      g_prevEffModeForStable = -999;
+ 
+@@ -986,13 +997,19 @@
+ bool HasPendingAt(double price,int side)
+ {
+    int t1=(side>0)?OP_BUYLIMIT:OP_SELLLIMIT;
+    int t2=(side>0)?OP_BUYSTOP :OP_SELLSTOP;
++   // NEW: tolerate ATR-buffer-shifted triggers so we don't duplicate when ATR wiggles
++   int tolPts = MathMax(MathMax(1, EntryBufferPoints), BufferPointsEffective());
++   double tol = MathMax(Point, tolPts * Point);
+    for(int i=OrdersTotal()-1;i>=0;i--)
+    {
+       if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+       if(OrderSymbol()!=Symbol()||OrderMagicNumber()!=MagicNumber) continue;
+       int type=OrderType();
+-      if(type==t1||type==t2)
+-         if(MathAbs(OrderOpenPrice()-price)<=MathMax(1,EntryBufferPoints)*Point) return true;
++      if(type==t1||type==t2)
++      {
++         if(MathAbs(OrderOpenPrice()-price) <= tol)
++            return true;
++      }
+    }
+    return false;
+ }
+@@
+ // In OnInit (or where you initialize runtime state), add:
+ // g_prevEffModeForStable = g_lastEffMode; g_modeStableBars = 0;
+@@
+ // In OnTick(), compute newBar once near the top:
+ // bool newBar = (Time[0] != g_lastBarTime);
+@@
+ // Recenter gating + throttle (replace existing recenter block):
+-   bool recentered=false;
+-   if(RecenterWhenRangeShifts && IsNum(g_prevTop) && IsNum(g_prevBot) && IsNum(g_rangeCtr))
+-   {
+-      double prevH = g_prevTop - g_prevBot; if(prevH<=Point) prevH=Point;
+-      double shiftPct = 100.0*MathAbs(g_rangeCtr - g_prevCtr)/prevH;
+-      if(shiftPct >= RecenterThresholdPct)
+-      {
+-         if(KeepHistoricalRangeMarks && ShowVisualDebug && DrawRangeLines) SnapshotOldRange();
+-         CancelPendingOrders();
+-         recentered=true;
+-      }
+-   }
++   bool recentered=false;
++   if(RecenterWhenRangeShifts && IsNum(g_prevTop) && IsNum(g_prevBot) && IsNum(g_rangeCtr))
++   {
++      bool allowCheck = (!RecenterCheckOnNewBarOnly) || newBar;
++      if(allowCheck && (TimeCurrent() - g_lastRebuildAt) >= RebuildThrottleSeconds)
++      {
++         double prevH = g_prevTop - g_prevBot; if(prevH < 5*Point) prevH = 5*Point; // floor
++         double shiftPct = 100.0*MathAbs(g_rangeCtr - g_prevCtr)/prevH;
++         if(shiftPct >= RecenterThresholdPct)
++         {
++            if(KeepHistoricalRangeMarks && ShowVisualDebug && DrawRangeLines) SnapshotOldRange();
++            CancelPendingOrders();
++            g_lastRebuildAt = TimeCurrent();
++            recentered=true;
++         }
++      }
++   }
+@@
+ // After computing effMode, track stability on closed bars:
+-   int effMode = EffectiveModeByStrategy(psiNow);
++   int effMode = EffectiveModeByStrategy(psiNow);
++   if(newBar)
++   {
++      if(effMode == g_prevEffModeForStable) g_modeStableBars++;
++      else { g_prevEffModeForStable = effMode; g_modeStableBars = 1; }
++   }
+@@
+ // Regime-change rebuild: require stability and throttle
+-   if(AutoRebuildOnRegimeChange && effMode!=g_lastEffMode)
+-   {
+-      CancelPendingOrders();
+-      g_lastEffMode = effMode;
+-   }
++   if(AutoRebuildOnRegimeChange && effMode!=g_lastEffMode)
++   {
++      if(newBar && g_modeStableBars >= MathMax(1, RegimeChangeConfirmBars) &&
++         (TimeCurrent() - g_lastRebuildAt) >= RebuildThrottleSeconds)
++      {
++         CancelPendingOrders();
++         g_lastRebuildAt = TimeCurrent();
++         g_lastEffMode = effMode;
++      }
++      else
++      {
++         g_lastEffMode = effMode; // remember mode; no immediate rebuild
++      }
++   }
+@@
+ // Where you update previous range, keep this (so recenter compares previous vs current):
+ // g_prevTop=g_rangeTop; g_prevBot=g_rangeBot; g_prevCtr=g_rangeCtr;
