@@ -1,0 +1,26 @@
+# MetaTrader 4 / MQL4 compiled outputs
+*.ex4
+*.ex5
+
+# MT4 runtime/output folders (don’t commit logs, tester outputs, etc.)
+MQL4/Logs/
+MQL4/Files/
+MQL4/History/
+MQL4/Profiles/
+MQL4/Tester/
+MQL4/MQLCache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.code-workspace
+
+# Temp files
+*.tmp
+*.bak
+*.log

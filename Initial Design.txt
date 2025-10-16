@@ -1,0 +1,258 @@
+Absolutely—let’s lock down a clear, testable design first. We’ll build the EA in modular layers, include on-chart visuals and rich logging for easier verification, and make breakeven+profit logic configurable for both same-direction baskets and opposite-direction netting. Below is a structured design you can review and adjust before we write code.
+
+Snippet reference (from your README)
+```markdown
+  - NetCloseMinProfitMoney (opposite-direction breakeven+profit)
+```
+
+Design goals
+- Adaptive grid that works in both ranging and trending regimes
+- Multi-indicator coherence: require several signals within N bars (or a weighted score) before acting
+- Auto re-centering of the grid based on VWAP, ZigZag mid, or both
+- Basket management that supports:
+  - Same-direction breakeven+profit closure (per side, configurable)
+  - Opposite-direction breakeven+profit (net across both sides)
+  - Same-direction basket TP and per-order TP/SL
+  - Priority policy: breakeven-first optional, with regime-based overrides
+- Strong observability: on-chart visualization + structured logging/CSV for testing
+- Broker compatibility considerations (hedging vs netting accounts)
+
+Architecture overview
+- Modules
+  - Indicator Engine:
+    - ZigZag (range context)
+    - VWAP (day/session anchored) with slope and distance metrics
+    - Squeeze detector (BB vs KC), optional TTM Squeeze via iCustom
+    - Optional trend filters: EMA slope/stack, ADX, Supertrend, Donchian bias, RSI trend, Ichimoku baseline/kijun angle (toggles)
+    - Optional range filters: ATR bandwidth, Fractal width, Donchian channel width, Bollinger bandwidth
+  - Signal Aggregator:
+    - Coherence window: all required conditions within N bars OR weighted scoring with threshold
+    - Direction resolution: +1 up, -1 down, 0 neutral
+    - Regime classification: Range-only, Trend-only, or Auto
+  - Grid Engine:
+    - Center selector: VWAP, ZigZagMid, or Blend
+    - Placement mode: LimitsOnly (range), StopsTrend (breakout/trend), BothEntries
+    - Dynamic step sizing: ATR-based with min/max constraints
+    - Levels per side, lot sizing (fixed/geometric/volatility-scaled), max orders
+    - Re-centering triggers: drift threshold, flat position, periodic, or indicator event
+  - Basket Manager:
+    - Per-side basket P/L tracking (buys and sells) and net P/L
+    - Same-direction breakeven+profit thresholds (separate for long/short)
+    - Opposite-direction net breakeven+profit target
+    - Same-direction basket TP, per-order TP/SL, optional trailing baskets
+    - Priority policy engine (breakeven-first toggle, regime override)
+  - Risk Manager:
+    - Equity DD stop, margin safety, spread/volatility filters, max lots/orders, news blackout
+  - UI & Logging:
+    - On-chart overlays: grid levels, centerlines, regime/signal badges, squeeze state, VWAP slope arrow, basket P/L badges
+    - Control panel (buttons): Pause/Resume, Flatten, Recenter Now, Toggle Visuals
+    - Structured logs: Experts log and CSV/JSON lines for Strategy Tester auditability
+
+Trading logic (high level)
+- Regime selection
+  - Range-only: place buy/sell limit grids around center; both directions open
+  - Trend-only: place stop orders in trend direction or pullback limits on trend side only
+  - Auto: use Squeeze release direction + VWAP slope + optional filters to bias trend; otherwise range behavior
+- Entries
+  - Require coherence: signals aligned within SignalWindowBars or reach a SignalScore >= threshold
+  - Constrain entries by MaxSpread, MaxOrders, and volatility guards
+- Exits (priorities)
+  - If PriorityBreakevenFirst: check breakeven+profit closures first
+    - Opposite-direction net breakeven+profit (NetCloseMinProfitMoney)
+    - Same-direction breakeven+profit per side (LongBreakevenMinProfit, ShortBreakevenMinProfit)
+  - Then same-direction basket TP per side (BasketTPMoneyLong/BasketTPMoneyShort)
+  - Then per-order TP/SL
+  - Safety/force exits: equity DD stop, time-based flatten, news window
+- Re-centering
+  - Update center when:
+    - Price drift from current center > RecenterThresholdPips
+    - Flat and RecenterOnFlatClose
+    - Periodic schedule (e.g., every X minutes)
+    - Squeeze release event (optional tick box)
+
+Indicators and coherence
+- Trend filters (toggleable)
+  - VWAP: price relative to VWAP + slope magnitude threshold
+  - EMA stack: e.g., EMA20 > EMA50 > EMA100 for uptrend; use slopes
+  - ADX: ADX > threshold confirms trend; DI+/DI- for direction
+  - Supertrend direction
+  - Donchian: price above mid or upper channel bias
+- Range filters (toggleable)
+  - ATR band narrowness: ATR/N-bars below threshold
+  - Bollinger bandwidth below threshold
+  - Donchian channel width below threshold
+  - ZigZag last swing height/width within range limits
+- Squeeze
+  - BB width < KC width = squeeze on; release detected on transition
+  - Direction inference: price vs VWAP and VWAP slope (or TTM Squeeze histogram if available via iCustom)
+- Coherence strategies
+  - Strict: all selected conditions must be true within SignalWindowBars
+  - Weighted scoring: each indicator contributes a score; act if score >= threshold
+
+Grid mechanics
+- Center modes
+  - VWAP (day or session anchored)
+  - ZigZagMid (last confirmed swing high/low midpoint)
+  - Blend (weighted VWAP and ZigZagMid)
+- Step size
+  - Fixed pips OR ATR-based: Step = max(MinStep, min(MaxStep, ATRMult * ATR))
+- Placement
+  - LevelsPerSide per direction
+  - EntryMode:
+    - LimitsOnly: grid below center for buys, above center for sells (range)
+    - StopsTrend: grid above center for buys, below center for sells (breakout)
+    - BothEntries: interleaved limits/stops
+- Lot sizing
+  - Fixed
+  - Multiplier (geometric)
+  - Volatility-scaled (reduce size as ATR rises, optional hard caps)
+
+Basket and closure policies
+- Same-direction basket management (per side)
+  - Parameters:
+    - BasketTPMoneyLong, BasketTPMoneyShort
+    - BasketBreakevenMinProfitLong, BasketBreakevenMinProfitShort
+    - BasketTrailLockMoneyLong/Short (optional)
+  - Behavior: when side P/L reaches breakeven+profit threshold, close that side; similarly for TP
+- Opposite-direction net close
+  - Parameter: NetCloseMinProfitMoney (as in your note)
+  - Behavior: close all buys and sells when total net P/L exceeds target
+- Priority and overrides
+  - PriorityBreakevenFirst (global)
+  - Regime-level overrides:
+    - In strong trend, allow trend-side basket to seek BasketTP before net breakeven close
+    - In range, prioritize breakeven to flatten exposure aggressively
+- Per-order
+  - Optional PerOrderTPPips/PerOrderSLPips
+  - Optional time-based expiry for pendings
+
+Risk management
+- EquityStopPct
+- MaxOrders, MaxLots, MaxLotsPerSide
+- MarginSafetyPct (flatten when free margin < threshold)
+- Spread filter, VolatilityHalt when ATR spike > threshold
+- News blackout windows (manual schedule at first; optional integration later)
+
+Visualization plan (ease of testing)
+- On-chart overlays
+  - Center lines: VWAP (gold), ZigZagMid (purple), Blend (white)
+  - Grid levels: buy levels (green), sell levels (red); different styles for limits vs stops
+  - Squeeze status badge: On (yellow), Released Up (blue), Released Down (magenta)
+  - VWAP slope arrow/text, regime label, coherence score/flags
+  - Basket P/L labels near price or in a corner panel
+  - Entry/exit arrows with tooltips (ticket, lots, reason)
+- Control panel buttons
+  - Pause/Resume entries
+  - Flatten all
+  - Recenter now
+  - Toggle visuals/logging verbosity
+- Logging
+  - Experts log: concise human-readable messages
+  - CSV file: timestamp; symbol; event; price; center; step; indicators; regime; decision; order tickets; P/L
+  - Optional JSON lines for downstream parsing
+  - Log levels: INFO, DECISION, ORDER, RISK, ERROR
+
+Parameter schema (draft)
+- Core
+  - MagicNumber, TradeComment, AllowedDirection (Both/LongOnly/ShortOnly)
+- Regime
+  - RegimeMode (Auto/RangeOnly/TrendOnly)
+  - SignalWindowBars
+  - UseWeightedCoherence (bool), SignalScoreThreshold (0–100)
+- Grid
+  - GridEntryMode (LimitsOnly/StopsTrend/BothEntries)
+  - LevelsPerSide
+  - StepMode (Fixed/ATR)
+  - GridStepPips
+  - StepATRMult, StepMinPips, StepMaxPips
+  - LotMode (Fixed/Multiplier/VolatilityScaled), BaseLot, LotMultiplier, VolScaleATRRef, MaxLot, MaxLotsPerSide
+- Centering/Re-center
+  - GridCenterMode (VWAP/ZigZagMid/Blend), BlendWeightVWAP
+  - RecenterThresholdPips
+  - RecenterOnFlatClose
+  - RecenterPeriodicMinutes
+  - RecenterOnSqueezeRelease
+- Indicators
+  - ZigZag: Depth, Deviation, Backstep
+  - VWAP: Anchor (Day/Session), SlopePeriod, SlopeThreshold
+  - Squeeze: BBPeriod, BBDev, KCPeriod, KCMultATR
+  - EMA: EMAFast, EMAMid, EMASlow, UseEMAStack
+  - ADX: ADXPeriod, ADXThreshold, UseADX
+  - Donchian: DonchPeriod, UseDonchian
+  - ATR: ATRPeriod
+  - Supertrend: Inputs..., UseSupertrend
+  - UseTTMSqueeze (via iCustom), IndicatorNameTTM, BufferMap...
+- Exits (per side + net)
+  - BasketTPMoneyLong, BasketTPMoneyShort
+  - BasketBreakevenMinProfitLong, BasketBreakevenMinProfitShort
+  - BasketTrailLockMoneyLong, BasketTrailLockMoneyShort
+  - PerOrderTPPips, PerOrderSLPips
+  - NetCloseMinProfitMoney
+  - AllowSameDirectionClose (true/false)
+  - AllowOppositeNetClose (true/false)
+  - PriorityBreakevenFirst (true/false)
+  - RegimeOverrideBreakevenFirst (Auto only) [None/Enforce/Disable]
+- Risk/Execution
+  - MaxOrders, MaxOrdersPerSide
+  - EquityStopPct, MarginSafetyPct
+  - MaxSpreadPoints
+  - VolatilityHaltATRMult
+  - Slippage
+  - TradeHours filter
+  - News blackout schedule (manual list of ranges)
+- Debug
+  - ShowPanel, ShowGrid, ShowIndicators, ShowSignals
+  - LogLevel, WriteCSV, CSVPath
+
+State machine
+- States: Paused, Idle, GridPlaced, Managing, Flattening
+- Events: NewBar, SqueezeRelease, DriftExceeded, BasketHitBE, BasketHitTP, EquityStop, NewsWindow
+- Transitions:
+  - Idle -> GridPlaced when signals coherent and risk OK
+  - Managing -> Flattening on any exit condition
+  - Flattening -> Idle when flat and optional re-center
+
+Coherence and decision pseudocode
+- Direction and regime resolution:
+  - condUp = TrendFilterUp AND (SqueezeReleasedUp OR TrendFiltersVoteUp >= threshold)
+  - condDn = TrendFilterDn AND (SqueezeReleasedDn OR TrendFiltersVoteDn >= threshold)
+  - if RegimeMode == TrendOnly: dir = condUp ? +1 : condDn ? -1 : 0
+  - if RegimeMode == RangeOnly: dir = 0
+  - if RegimeMode == Auto:
+    - if condUp XOR condDn: dir = corresponding
+    - else dir = 0 (range behavior)
+- Entry allowed if all required signals within SignalWindowBars (strict) or score >= SignalScoreThreshold
+
+Exit priority guidance
+- Default recommendation: prioritize breakeven closures to reduce exposure
+  - In trend, consider RegimeOverrideBreakevenFirst=Disable to let the trend basket reach BasketTP first
+- Both same-direction and opposite-direction closures should support breakeven+profit thresholds, each independently configurable
+
+Testing plan
+- Backtest scenarios (M5–H1) across:
+  - Range day: tight daily ATR, frequent BE closures
+  - Trend day up/down: strong VWAP slope, trend-only entries
+  - Squeeze release: entries biased by release direction, check re-center triggers
+  - Parameter sweeps: StepMode Fixed vs ATR, LevelsPerSide variations
+  - Stress: high spread, ATR spike, margin pressure, equity DD stop
+- Verify via:
+  - On-chart overlays and panel statuses (center lines, grid, labels)
+  - CSV logs (every decision, indicator values, P/L and closures)
+  - Cross-check basket P/L math with Strategy Tester results
+
+Milestones
+- M1: Skeleton EA with parameters, indicator reads, signal aggregator (strict mode), fixed-step grid, basic logging
+- M2: Basket manager with all closure modes, priority policy, on-chart P/L labels
+- M3: Visualization overlays and control panel; CSV logging
+- M4: ATR-based step, additional trend/range indicators, coherence scoring
+- M5: Risk extensions, news filter, periodic re-center; refinements and optimizations
+
+Clarifications to proceed
+- Which additional indicators do you want first (EMA stack, ADX, Supertrend, Donchian, RSI, Ichimoku)?
+- Preferred VWAP anchor (daily midnight server time vs specific session)?
+- Default timeframe(s) and symbols?
+- Lot sizing preference (fixed vs multiplier vs volatility-scaled)?
+- Hedging availability on your account (needed for opposite-direction baskets)?
+- Acceptable max drawdown and target win rate to guide default thresholds?
+
+If you confirm this design (or note changes), I’ll implement Milestone M1 with the visuals and logging foundations so testing is straightforward from day one.
